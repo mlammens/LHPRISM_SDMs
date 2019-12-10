@@ -1,0 +1,261 @@
+Please find below the R code history from your *Wallace* v1.0.6 session.
+
+You can reproduce your session results by running this R Markdown file in RStudio.
+
+Each code block is called a "chunk", and you can run them either one-by-one or all at once by choosing an option in the "Run" menu at the top-right corner of the "Source" pane in RStudio.
+
+For more detailed information see <http://rmarkdown.rstudio.com>).
+
+### Package installation
+
+Wallace uses the following R packages that must be installed and loaded before starting.
+
+```{r}
+library(spocc)
+library(spThin)
+library(dismo)
+library(rgeos)
+library(ENMeval)
+library(dplyr)
+library(purrr)
+```
+
+Wallace also includes several functions developed to help integrate different packages and some additional functionality. For this reason, it is necessary to load the file `functions.R`, The function `system.file()` finds this script, and `source()` loads it.
+
+```{r}
+source(system.file('shiny/funcs', 'functions.R', package = 'wallace'))
+```
+
+Record of analysis for *Ailanthus altissima*.
+---------------------------------------------
+
+### Obtain Occurrence Data
+
+The search for occurrences was limited to 10^{4} records. Obtain occurrence records of the selected species from the gbif database.
+
+```{r}
+# query selected database for occurrence records
+spnames <- c("Ailanthus altissima", "Arum italicum", "Corydalis incisa", "Cytisus scoparius", "Kalopanax septemlobus", "Koelreuteria paniculata", "Pyrus calleryana", "Symplocos paniculata", "Zelkova serrata", "Euonymus alatus", "Miscanthus sinensis")
+results <- spocc::occ(query = spnames, from = "gbif", limit = 1000, has_coords = TRUE)
+
+# make a new data.frame of only gbif results
+results.data <- results[["gbif"]]$data
+
+# create an empty list object for occs.data
+occs.data <- list()
+
+for(x in 1:length(results.data)){
+  occs.dups <- duplicated(results.data[[x]][c('longitude', 'latitude')])
+  occs <- results.data[[x]][!occs.dups,]
+  # make sure latitude and longitude are numeric (sometimes they are characters)
+  occs$latitude <- as.numeric(occs$latitude)
+  occs$longitude <- as.numeric(occs$longitude)
+  # give all records a unique ID
+  occs$occID <- row.names(occs)
+  
+  # make a larger occs.data list of the new data.frams
+  occs.data[[x]] <- occs
+}
+
+names(occs.data) <- names(results.data)
+
+```
+
+### Process Occurrence Data
+
+The following code recreates the polygon used to select occurrences to keep in the analysis.
+
+```{r}
+selCoords <- data.frame(x = c(-100.5499, -58.6888, -77.3328, -103.3641, -100.5499), y = c(49.5461, 48.857, 21.5239, 22.1765, 49.5461))
+selPoly <- sp::SpatialPolygons(list(sp::Polygons(list(sp::Polygon(selCoords)), ID=1)))
+for(x in 1:length(occs.data)){
+  occs.xy <- occs.data[[x]][c('longitude', 'latitude')]
+  sp::coordinates(occs.xy) <- ~ longitude + latitude
+  intersect <- sp::over(occs.xy, selPoly)
+  intersect.rowNums <- as.numeric(which(!(is.na(intersect))))
+  occs.data[[x]] <- occs.data[[x]][intersect.rowNums, ]
+}
+```
+
+### Obtain Environmental Data
+
+Using WorldClim (<http://www.worldclim.org/>) bioclimatic dataset at resolution of 2.5 arcmin.
+
+```{r}
+# get WorldClim bioclimatic variable rasters
+envs <- raster::getData(name = "worldclim", var = "bio", res = 2.5, lat = , lon = , download = TRUE)
+# change names rasters variables
+envRes <- 2.5
+if (envRes == 0.5) {
+  i <- grep('_', names(envs))
+  editNames <- sapply(strsplit(names(envs)[i], '_'), function(x) x[1])
+  names(envs)[i] <- editNames
+}
+i <- grep('bio[0-9]$', names(envs))
+editNames <- paste('bio', sapply(strsplit(names(envs)[i], 'bio'), function(x) x[2]), sep='0')
+names(envs)[i] <- editNames
+# subset by those variables selected
+envs <- envs[[c('bio01', 'bio02', 'bio03', 'bio04', 'bio05', 'bio06', 'bio07', 'bio08', 'bio09', 'bio10', 'bio11', 'bio12', 'bio13', 'bio14', 'bio15', 'bio16', 'bio17', 'bio18', 'bio19')]]
+
+# extract environmental values at occ grid cells
+for(x in 1:length(occs.data)){
+  locs.vals <- raster::extract(envs[[1]], occs.data[[x]][, c('longitude', 'latitude')])
+  # remove occs without environmental values
+  occs.data[[x]] <- occs.data[[x]][!is.na(locs.vals), ]
+}
+```
+
+### Process Environmental Data
+
+Background selection technique chosen as Minimum Convex Polygon.
+
+```{r}
+bgExt.list <- list()
+for(x in 1:length(occs.data)){
+  occs.xy <- occs.data[[x]][c('longitude', 'latitude')]
+  sp::coordinates(occs.xy) <- ~ longitude + latitude
+  # Buffer size of the study extent polygon defined as 0.5 degrees
+  bgExt.list[[x]] <- rgeos::gBuffer(mcp(occs.xy), width = 0.5)
+}
+```
+
+Mask environmental variables by Minimum Convex Polygon, and take a random sample of background values from the study extent. As the sample is random, your results may be different than those in the session. If there seems to be too much variability in these background samples, try increasing the number from 10,000 to something higher (e.g. 50,000 or 100,000). The better your background sample, the less variability you'll have between runs.
+
+```{r}
+bg.xy.list <- list()
+for(x in 1:length(bgExt.list)){
+  # crop the environmental rasters by the background extent shape
+  envsBgCrop <- raster::crop(envs, bgExt.list[[x]])
+  # mask the background extent shape from the cropped raster
+  envsBgMsk <- raster::mask(envsBgCrop, bgExt.list[[x]])
+  # sample random background points
+  bg.xy <- dismo::randomPoints(envsBgMsk, 10000)
+  # convert matrix output to data frame
+  bg.xy <- as.data.frame(bg.xy)  
+  # add to list object
+  bg.xy.list[[x]] <- bg.xy
+}
+```
+
+### Partition Occurrence Data
+
+Occurrence data is now partitioned for cross-validation, a method that iteratively builds a model on all but one group and evaluates that model on the left-out group.
+
+For example, if the data is partitioned into 3 groups A, B, and C, a model is first built with groups A and B and is evaluated on C. This is repeated by building a model with B and C and evaluating on A, and so on until all combinations are done.
+
+Cross-validation operates under the assumption that the groups are independent of each other, which may or may not be a safe assumption for your dataset. Spatial partitioning is one way to ensure more independence between groups.
+
+You selected to partition your occurrence data by the method.
+
+```{r}
+group.data.list <- list()
+for(x in 1:length(occs.data)){
+  occs.xy <- occs.data[[x]][c('longitude', 'latitude')]
+  group.data.list[[x]] <- ENMeval::get.randomkfold(occ=occs.xy, bg.coords=bg.xy.list[[x]], kfolds=4)
+}
+```
+
+### Build and Evaluate Niche Model
+
+You selected the maxent model.
+
+```{r}
+# define the vector of regularization multipliers to test
+rms <- seq(1, 1, 1)
+
+enm.model.list <- list()
+
+for(x in 1:length(occs.data)){
+  # pull out the occurrence and background partition group numbers from the list
+  occs.grp <- group.data.list[[x]][[1]]
+  bg.grp <- group.data.list[[x]][[2]]
+  
+  ## Get occs.xy again
+  occs.xy <- occs.data[[x]][c('longitude', 'latitude')]
+  
+  ## Define envsBgMsk again
+  # crop the environmental rasters by the background extent shape
+  envsBgCrop <- raster::crop(envs, bgExt.list[[x]])
+  # mask the background extent shape from the cropped raster
+  envsBgMsk <- raster::mask(envsBgCrop, bgExt.list[[x]])
+
+  # iterate model building over all chosen parameter settings
+  e <- ENMeval::ENMevaluate(occs.xy, envsBgMsk, bg.coords = bg.xy.list[[x]], RMvalues = rms, fc = 'LQ', 
+                            method = 'user', occs.grp, bg.grp, clamp = TRUE, algorithm = "maxnet")
+  
+  ## add model to model list
+  enm.model.list[[x]] <- e
+}
+
+## Name each model
+names(enm.model.list) <- names(results.data)
+
+
+# # unpack the results data frame, the list of models, and the RasterStack of raw predictions
+# evalTbl <- e@results
+# evalMods <- e@models
+# names(evalMods) <- e@results$settings
+# evalPreds <- e@predictions
+```
+
+```{r}
+# view ENMeval results
+ENMeval::eval.plot(evalTbl, value = "avg.test.AUC")
+```
+
+```{r}
+# Select your model from the models list
+mod <- evalMods[["LQ_1"]]
+```
+
+```{r}
+# generate cloglog prediction
+pred <- ENMeval::maxnet.predictRaster(mod, envsBgMsk, type = 'cloglog', clamp = TRUE) 
+```
+
+```{r}
+# plot the model prediction
+plot(pred)
+```
+
+### Project Niche Model
+
+You selected to project your model. First define a polygon with the coordinates you chose, then crop and mask your predictor rasters. Finally, predict suitability values for these new raster cells based on the model you selected.
+
+```{r}
+projCoords <- data.frame(x = c(-80.4231, -75.3684, -73.0828, -72.951, -71.1049, -73.9179, -79.9835, -80.4231), y = c(42.6106, 45.3298, 45.4532, 42.1561, 40.5731, 39.5642, 41.5341, 42.6106))
+projPoly <- sp::SpatialPolygons(list(sp::Polygons(list(sp::Polygon(projCoords)), ID=1)))
+```
+
+### Project Niche Model to New Extent
+
+Now use crop and mask the predictor variables by projPoly, and use the maxnet.predictRaster() function to predict the values for the new extent based on the model selected.
+
+```{r}
+predsProj <- raster::crop(envs, projPoly)
+predsProj <- raster::mask(predsProj, projPoly)
+#proj <- ENMeval::maxnet.predictRaster(mod, predsProj, type = 'cloglog', clamp = TRUE)
+proj_raster <- stack()
+for(x in 1:length(enm.model.list)){
+  proj_raster <- stack(proj_raster, 
+                       ENMeval::maxnet.predictRaster(enm.model.list[[x]]@models[[1]], 
+                                                     predsProj, type = 'cloglog', clamp = TRUE))
+}
+```
+
+```{r}
+# plot the model prediction
+names(proj_raster) <- names(results.data)
+plot(proj_raster)
+```
+
+
+```{r}
+for(x in 1:length(names(proj_raster))){
+  pdf(file = paste0(names(proj_raster)[x],"_Eastern_US_SDMs.pdf"),
+      width = 7.5, height = 7.5)
+  plot(proj_raster[[x]])
+  dev.off()
+}
+```
+
